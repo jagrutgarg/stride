@@ -1,26 +1,25 @@
-"""Excel (.xlsx) export: 'IMU Data', 'TENG Data' and 'Session Summary' sheets.
+"""Excel (.xlsx) and CSV export of a session. Runs in a background thread; the UI never waits for it.
 
-Uses openpyxl write-only mode (constant memory, fast). A sheet that would exceed
-Excel's row limit continues on 'IMU Data 2', 'TENG Data 2', ... so no row is lost.
-The file is written to a temporary name and renamed on success, so a failed export
-never leaves a half-written file at the chosen path.
+Excel sheets: 'TENG Data' (one row per sample and channel, with a channel-name column because each channel has its
+own sample times), 'IMU Data' and 'Session Summary'. A sheet that would exceed Excel's row limit continues on
+'... 2', '... 3' so no row is lost. Rows are written in chunks (openpyxl write-only mode: constant memory). The file is
+written to a temporary name and renamed on success, so a failed export never leaves a half-written file.
+
+CSV: one row per TENG sample (time, timestamp, channel, volts, validity) followed by the IMU columns of the most
+recent IMU frame at or before that sample.
 """
 from __future__ import annotations
 
 import os
-import time
 from datetime import datetime
 from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import Font
 
 from config import settings
-from sensors.teng_processor import REF_TEXT
-from storage.session import (FLAG_CAL, FLAG_CLIP, IMU_COLUMNS, IMU_IDX, SessionStore,
-                             TENG_COLUMNS, TENG_IDX)
+from storage.session import FLAG_CAL, FLAG_CLIP, IMU_COLUMNS, IMU_IDX, SessionStore, TENG_IDX
 
 ProgressCb = Optional[Callable[[int, int], None]]
 CHUNK = 20000
@@ -37,16 +36,13 @@ def _timestamps(start_wall: float, t_rel: np.ndarray) -> np.ndarray:
 def _to_rows(ts: np.ndarray, block: np.ndarray):
     obj = block.astype(object)
     obj[pd.isna(obj)] = None
-    rows = obj.tolist()
-    return [[t, *r] for t, r in zip(ts.tolist(), rows)]
+    return [[t, *r] for t, r in zip(ts.tolist(), obj.tolist())]
 
 
-def _write_table(wb: Workbook, base: str, headers: list, data: np.ndarray, start_wall: float,
-                 build_block, progress: Callable[[int], None]):
+def _write_table(wb: Workbook, base: str, headers: list, data: np.ndarray, start_wall: float, build_block, progress):
     limit = settings.EXCEL_MAX_ROWS_PER_SHEET
     n = len(data)
-    sheet_i, row_in_sheet, ws = 0, 0, None
-    start = 0
+    sheet_i, row_in_sheet, ws, start = 0, 0, None, 0
     while True:
         if ws is None or row_in_sheet >= limit:
             sheet_i += 1
@@ -59,7 +55,7 @@ def _write_table(wb: Workbook, base: str, headers: list, data: np.ndarray, start
             break
         end = min(n, start + CHUNK, start + (limit - row_in_sheet))
         block = data[start:end]
-        ts = _timestamps(start_wall, block[:, 0])
+        ts = _timestamps(start_wall, block[:, 0].astype(np.float64))
         for row in _to_rows(ts, build_block(block)):
             ws.append(row)
         row_in_sheet += end - start
@@ -68,91 +64,68 @@ def _write_table(wb: Workbook, base: str, headers: list, data: np.ndarray, start
     return sheet_i
 
 
-def _imu_stats(imu: np.ndarray) -> pd.DataFrame:
-    skip = {"t_rel", "device_ms", "seq", "segment", "imu_ok"}
-    cols = [(k, lbl) for k, lbl in IMU_COLUMNS if k not in skip]
-    df = pd.DataFrame(imu[:, [IMU_IDX[k] for k, _ in cols]], columns=[l for _, l in cols])
-    return df
+def _names(store: SessionStore) -> list:
+    return list(store.channel_labels) or ["TENG"]
 
 
-def _teng_stats(teng: np.ndarray) -> pd.DataFrame:
-    valid = teng[(teng[:, TENG_IDX["flags"]].astype(int) & FLAG_CAL) == 0]
-    return pd.DataFrame({"TENG Voltage (V)": valid[:, TENG_IDX["v"]]})
+def _sorted_teng(teng: np.ndarray) -> np.ndarray:
+    """Channels are appended frame by frame; present the samples in time order."""
+    if len(teng) and len(np.unique(teng[:, TENG_IDX["ch"]])) > 1:
+        return teng[np.argsort(teng[:, 0], kind="stable")]
+    return teng
 
 
 def _rate(t: np.ndarray) -> float:
     return (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 and t[-1] > t[0] else float("nan")
 
 
-def export_xlsx(store: SessionStore, path: str, extra: dict | None = None,
-                progress: ProgressCb = None) -> dict:
-    """Write the whole session. Returns {'imu_rows', 'teng_rows', 'path'}."""
+def _f(x):
+    return None if pd.isna(x) else float(x)
+
+
+def _validity(fl: np.ndarray) -> np.ndarray:
+    return np.where(fl & FLAG_CAL, "Invalid: baseline calibrating",
+                    np.where(fl & FLAG_CLIP, "Clipped: beyond measurable range", "Valid")).astype(object)
+
+
+def export_xlsx(store: SessionStore, path: str, extra: dict | None = None, progress: ProgressCb = None) -> dict:
     extra = extra or {}
-    imu = store.imu.data          # append-only: rows [0:n] never change, safe to read
-    teng = store.teng.data        # while the GUI keeps appending in another thread
-    imu, teng = imu[: len(imu)], teng[: len(teng)]
-    total = len(imu) + 2 * len(teng)
-    done = 0
+    names = _names(store)
+    imu, teng = store.snapshot()
+    imu, teng = imu[: len(imu)], _sorted_teng(teng[: len(teng)])
+    total, done = len(imu) + len(teng), 0
 
     def tick(k):
         nonlocal done
         done += k
         if progress:
-            progress(done, total)
+            progress(done, max(total, 1))
 
     tmp = path + ".tmp"
     wb = Workbook(write_only=True)
-    bold = Font(bold=True)
-
-    # ---- TENG (sheet 1): timestamp, voltage, A0 reference status, measurement validity ----
     ti = TENG_IDX
-    teng_headers = ["Timestamp", "Time (s)", "TENG Voltage (V)", "A0 Reference Status",
-                    "Measurement Validity", "Display segment"]
-    ref_names = np.array([REF_TEXT[k] for k in sorted(REF_TEXT)], dtype=object)
+    name_arr = np.array(names, dtype=object)
 
     def teng_block(b):
-        fl = b[:, ti["flags"]].astype(int)
-        validity = np.where(fl & FLAG_CAL, "Invalid: baseline calibrating",
-                            np.where(fl & FLAG_CLIP, "Clipped: beyond measurable range", "Valid")).astype(object)
         out = np.empty((len(b), 5), dtype=object)
         out[:, 0] = b[:, ti["t_rel"]]
-        out[:, 1] = b[:, ti["v"]]                     # voltage exactly as sent by the firmware
-        out[:, 2] = ref_names[b[:, ti["ref"]].astype(int)]
-        out[:, 3] = validity
+        out[:, 1] = name_arr[b[:, ti["ch"]].astype(int)]
+        out[:, 2] = b[:, ti["v"]]                      # calibrated by config/channels.py exactly once
+        out[:, 3] = _validity(b[:, ti["flags"]].astype(int))
         out[:, 4] = b[:, ti["segment"]]
         return out
 
-    n_teng_sheets = _write_table(wb, "TENG Data", teng_headers, teng, store.start_wall, teng_block, tick)
+    n_teng_sheets = _write_table(wb, "TENG Data", ["Timestamp", "Time (s)", "Channel", "TENG Voltage (V)",
+                                                   "Measurement Validity", "Display segment"],
+                                 teng, store.start_wall, teng_block, tick)
+    n_imu_sheets = _write_table(wb, "IMU Data", ["Timestamp"] + [lbl for _, lbl in IMU_COLUMNS], imu,
+                                store.start_wall, lambda b: b, tick)
 
-    # ---- IMU (sheet 2) ----
-    imu_headers = ["Timestamp"] + [lbl for _, lbl in IMU_COLUMNS]
-    n_imu_sheets = _write_table(wb, "IMU Data", imu_headers, imu, store.start_wall, lambda b: b, tick)
-
-    # ---- Scope steps (single-shot captures) ----
-    steps = list(store.steps)
-    st_arr = np.array([[s.t_rel, s.index, s.vpp, s.pos_peak, s.neg_peak,
-                        np.nan if s.width_ms is None else s.width_ms,
-                        np.nan if s.rise_ms is None else s.rise_ms,
-                        s.n_samples, s.clipped, s.truncated, s.segment] for s in steps]).reshape(-1, 11)
-    st_headers = ["Timestamp", "Time of trigger (s)", "Step #", "Vpp (V)", "Positive peak (V)",
-                  "Negative peak (V)", "Pulse width @50% (ms)", "Rise time 10-90% (ms)", "Samples captured",
-                  "Clipped (1=yes)", "Capture cut short (1=yes)", "Display segment"]
-    _write_table(wb, "Scope Steps", st_headers, st_arr, store.start_wall, lambda b: b, lambda k: None)
-
-    # Engineering/debug sheet: raw ADC codes live ONLY here (never in the GUI).
-    dbg_headers = ["Timestamp", "Time (s)", "ESP32 millis (ms)", "Raw ADC code (ADS1115 A0-A3, int16)",
-                   "TENG Voltage (V)"]
-
-    def dbg_block(b):
-        return np.column_stack([b[:, ti["t_rel"]], b[:, ti["device_ms"]], b[:, ti["raw"]], b[:, ti["v"]]])
-
-    _write_table(wb, "TENG Debug (raw)", dbg_headers, teng, store.start_wall, dbg_block, tick)
-
-    # ---- Summary ----
+    # ---- summary ----
     ws = wb.create_sheet("Session Summary")
-    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["A"].width = 46
     for col in "BCDEF":
-        ws.column_dimensions[col].width = 26
+        ws.column_dimensions[col].width = 28
     c = store.conn
     first = min([a[0, 0] for a in (imu, teng) if len(a)], default=None)
     last = max([a[-1, 0] for a in (imu, teng) if len(a)], default=None)
@@ -160,64 +133,37 @@ def export_xlsx(store: SessionStore, path: str, extra: dict | None = None,
     def wall(t):
         return "n/a" if t is None else _timestamps(store.start_wall, np.array([t]))[0]
 
-    nocal = teng[(teng[:, ti["flags"]].astype(int) & FLAG_CAL) == 0] if len(teng) else teng
-    tvv = nocal[:, ti["v"]] if len(nocal) else np.empty(0)
-    tv = {"mean": _f(tvv.mean()) if len(tvv) else None, "max": _f(tvv.max()) if len(tvv) else None,
-          "min": _f(tvv.min()) if len(tvv) else None}
-    if len(nocal):
-        codes, counts = np.unique(nocal[:, ti["ref"]].astype(int), return_counts=True)
-        ref_summary = "; ".join(f"{REF_TEXT[k]} ({n:,} samples)" for k, n in zip(codes, counts))
-    else:
-        ref_summary = "n/a"
-    ws.append(["Session Summary"]); ws.append([])
-    rows = [
-        ("Start time", wall(first)),
-        ("End time", wall(last)),
-        ("Duration (s)", None if first is None else round(last - first, 3)),
-        ("Total IMU samples (frames)", len(imu)),
-        ("Total TENG samples", len(teng)),
-        ("IMU sampling frequency (Hz, measured)", _rate(imu[:, 0]) if len(imu) else None),
-        ("TENG sampling frequency (Hz, measured)", _rate(teng[:, 0]) if len(teng) else None),
-        ("TENG samples/s reported by ESP32 (last)", extra.get("sr")),
-        ("Average TENG voltage (V)", tv["mean"]),
-        ("Maximum TENG voltage (V)", tv["max"]),
-        ("Minimum TENG voltage (V)", tv["min"]),
-        ("TENG voltage statistics basis", "valid-or-clipped samples; baseline-calibration samples excluded"),
-        ("Reference (A0) status", ref_summary),
-        ("Connection status at export", extra.get("conn_state", "n/a")),
-        ("Scope steps captured", len(steps)),
-        ("Largest step Vpp (V)", max((s.vpp for s in steps), default=None)),
-        ("Scope window at export (s) / step threshold (V)", extra.get("scope", "n/a")),
-        ("Mode", c.mode),
-        ("ESP32 address", c.host), ("Port", c.port), ("URL", c.url),
-        ("Successful connections", c.connect_count), ("Disconnections", c.disconnect_count),
-        ("Frames received OK", c.frames_ok), ("Invalid frames", c.frames_invalid),
-        ("Duplicate frames ignored", c.frames_duplicate), ("Missing frames (seq gaps)", c.frames_missed),
-        ("Firmware sends per-sample raw ADC (debug sheet)", c.firmware_has_raw),
-        ("Display segments (Reset/Restart count + 1)", store.segment + 1),
-        ("TENG channel", settings.TENG_CHANNEL_LABEL),
-        ("TENG unit", settings.TENG_UNIT),
-        ("TENG calculation", settings.TENG_FORMULA_TEXT),
-        ("Timestamp note", "Wall-clock = session start + ESP32 clock; accurate to the first frame's latency and +/-1 ms."),
-        ("Exported at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-    ]
+    ws.append(["Session Summary"])
+    ws.append([])
+    rows = [("Start time", wall(first)), ("End time", wall(last)),
+            ("Duration (s)", None if first is None else round(last - first, 3)),
+            ("TENG channels", ", ".join(names)), ("Total IMU samples (frames)", len(imu)),
+            ("Total TENG samples (all channels)", len(teng)),
+            ("IMU sampling frequency (Hz, measured)", _rate(imu[:, 0]) if len(imu) else None)]
+    for k, label in enumerate(names):
+        sel = teng[teng[:, ti["ch"]] == k] if len(teng) else teng
+        valid = sel[(sel[:, ti["flags"]].astype(int) & FLAG_CAL) == 0] if len(sel) else sel
+        vv = valid[:, ti["v"]] if len(valid) else np.empty(0)
+        rows += [(f"{label}: samples", len(sel)),
+                 (f"{label}: sampling frequency (Hz, measured)", _rate(sel[:, 0]) if len(sel) else None),
+                 (f"{label}: average voltage (V)", _f(vv.mean()) if len(vv) else None),
+                 (f"{label}: maximum voltage (V)", _f(vv.max()) if len(vv) else None),
+                 (f"{label}: minimum voltage (V)", _f(vv.min()) if len(vv) else None),
+                 (f"{label}: calibration applied", (extra.get("calibration") or {}).get(label, "n/a"))]
+    rows += [("Firmware info message", extra.get("info", "n/a")),
+             ("Statistics basis", "valid-or-clipped samples; baseline-calibration samples excluded"),
+             ("Connection status at export", extra.get("conn_state", "n/a")),
+             ("Mode", c.mode), ("ESP32 address", c.host), ("Port", c.port), ("URL", c.url),
+             ("Successful connections", c.connect_count), ("Disconnections", c.disconnect_count),
+             ("Frames received OK", c.frames_ok), ("Invalid frames", c.frames_invalid),
+             ("Duplicate frames ignored", c.frames_duplicate),
+             ("ESP32 stalls (frame gaps over 300 ms) / longest (ms)", f"{c.stalls} / {c.longest_stall_ms:.0f}"),
+             ("Display segments (Reset/Restart count + 1)", store.segment + 1),
+             ("Timestamp note", "Wall-clock = session start + ESP32 clock; accurate to the first frame's latency "
+                                "and +/-1 ms."),
+             ("Exported at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))]
     for k, v in rows:
         ws.append([k, v])
-    ws.append([])
-
-    def stats_table(title, df, note=""):
-        ws.append([title + note]); ws.append([])
-        ws.append(["Channel", "Min", "Max", "Average", "Count"])
-        for col in df.columns:
-            s = df[col]
-            ws.append([col, _f(s.min()), _f(s.max()), _f(s.mean()), int(s.count())])
-        ws.append([])
-
-    stats_table("IMU statistics (all samples, all segments)", _imu_stats(imu))
-    stats_table("TENG statistics", _teng_stats(teng),
-                " (calibration-period samples excluded)")
-    del bold
-
     try:
         wb.save(tmp)
         os.replace(tmp, path)
@@ -232,5 +178,46 @@ def export_xlsx(store: SessionStore, path: str, extra: dict | None = None,
             "sheets": {"IMU": n_imu_sheets, "TENG": n_teng_sheets}}
 
 
-def _f(x):
-    return None if pd.isna(x) else float(x)
+def export_csv(store: SessionStore, path: str, extra: dict | None = None, progress: ProgressCb = None) -> dict:
+    """One row per TENG sample: time, timestamp, channel, volts, validity, + the latest IMU frame at that time."""
+    names = _names(store)
+    imu, teng = store.snapshot()
+    imu, teng = imu[: len(imu)], _sorted_teng(teng[: len(teng)])
+    idx = [i for i, (k, _) in enumerate(IMU_COLUMNS) if k not in ("t_rel", "segment")]
+    imu_df = pd.DataFrame(imu[:, idx], columns=[IMU_COLUMNS[i][1] for i in idx])
+    imu_df.insert(0, "_t", imu[:, 0])
+    ti = TENG_IDX
+    tmp = path + ".tmp"
+    name_arr = np.array(names, dtype=object)
+    try:
+        first = True
+        for start in range(0, max(len(teng), 1), CHUNK):
+            b = teng[start:start + CHUNK]
+            if not len(b):
+                break
+            df = pd.DataFrame({
+                "time_s": b[:, ti["t_rel"]],
+                "timestamp": _timestamps(store.start_wall, b[:, ti["t_rel"]]),
+                "channel": name_arr[b[:, ti["ch"]].astype(int)],
+                "voltage_v": b[:, ti["v"]],
+                "validity": _validity(b[:, ti["flags"]].astype(int)),
+                "display_segment": b[:, ti["segment"]].astype(int),
+            })
+            if len(imu_df):
+                df = pd.merge_asof(df, imu_df, left_on="time_s", right_on="_t", direction="backward").drop(columns="_t")
+            df.to_csv(tmp, mode="w" if first else "a", header=first, index=False, float_format="%.6g")
+            first = False
+            if progress:
+                progress(min(start + CHUNK, len(teng)), max(len(teng), 1))
+        if first:                                   # no TENG samples at all: still write the header
+            pd.DataFrame(columns=["time_s", "timestamp", "channel", "voltage_v", "validity",
+                                  "display_segment"]).to_csv(tmp, index=False)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return {"imu_rows": len(imu), "teng_rows": len(teng), "path": path}

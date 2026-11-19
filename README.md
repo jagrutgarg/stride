@@ -1,23 +1,24 @@
 # Stride
 
-Real-time desktop monitor for a smart-shoe sensor node: an **ESP32-C3** streaming a **TENG** voltage (through an ADS1115)
-and **BNO08x** IMU data over Wi-Fi. Built with PySide6 and PyQtGraph, with oscilloscope-style measurements, step capture and Excel export.
+Real-time desktop monitor for a smart-shoe sensor node: an **ESP32** streaming three **TENG** voltages
+(Front A0, Middle A1, Back A2, read through an ADS1115) and **IMU** data over Wi-Fi.
+Built with PySide6 and pyqtgraph, small and fast on purpose.
 
 ![Stride running in Simulation mode (simulated data, not hardware)](docs/screenshot-simulation.png)
 
-## Features
+## What it shows
 
-- **Live TENG voltage** in volts (3 decimals), min / max / average, and a 30 s rolling trace with a zero line.
-- **Scope measurements** computed in the GUI from the raw samples: Vpp, Vmax, Vmin, mean, AC RMS over a selectable
-  100 ms / 500 ms / 1 s / 5 s window, Vmax/Vmin cursors on the chart, and **Hold Vpp**.
-- **Single-shot step capture:** trigger at an adjustable |v| threshold (default 1.0 V), 50 ms pre-trigger, ends after 150 ms below the
-  threshold. Per step: Vpp, positive peak, negative peak, pulse width at 50 %, 10–90 % rise time. Last 10 steps in a table.
-- **BNO08x panel:** accelerometer, gyroscope, magnetometer, linear acceleration, gravity, Euler angles, quaternion, accuracy, steps, stability.
-- **Graphs:** TENG, accelerometer, gyroscope, roll/pitch/yaw.
-- **Controls:** Pause/Resume (display only, recording continues), Reset, Restart (new session, asks before discarding unsaved data), Save.
-- **Excel export** (`.xlsx`): `TENG Data`, `IMU Data`, `Scope Steps`, `TENG Debug (raw)`, `Session Summary`. Sheets continue past 1,000,000 rows.
-- **Robustness:** reconnects automatically, flags clipping / calibration / invalid packets, drops duplicate frames, never discards recorded data silently.
-- **Simulation mode** with a built-in fake ESP32 (clearly marked, never mixed with live data).
+- **Header:** Connect, Disconnect, IP field, connection status, last data time, frame rate.
+  **Pause** (display only, recording continues), **Reset**, **Restart**, **Save**, and an "Unsaved: N IMU frames, N TENG samples" counter.
+- **Three TENG cards**, always "Front (A0)", "Middle (A1)", "Back (A2)", each with its own colour and exactly two numbers:
+  the newest voltage and the peak-to-peak voltage (Vmax − Vmin) over one shared sliding window
+  (100 ms, 500 ms, 1 s or 2 s; default 1 s). An asterisk follows Vpp when that channel clipped inside the window, and a red banner
+  shows while its clip bit is set.
+- **Charts:** three stacked TENG plots on a shared time axis (time window 1 to 30 s), then Accelerometer, Gyroscope and Orientation
+  (roll, pitch, yaw) side by side.
+- **Motion numbers:** accelerometer, gyroscope, Euler angles and the IMU status.
+- **Event log:** 200 lines, connection events and errors only (never one line per message).
+- **Simulation mode** (header dropdown): a built-in fake ESP32 speaks the same protocol, clearly marked as simulated and never mixed with live data.
 
 ## Install and run
 
@@ -31,66 +32,98 @@ python -m venv .venv
 .venv\Scripts\python imu_teng_monitor\main.py
 ```
 
-macOS / Linux: use `.venv/bin/python` instead of `.venv\Scripts\python`.
+macOS / Linux: use `.venv/bin/python`. Try it without hardware by choosing **Simulation** and pressing Connect.
+`orjson` is optional (faster JSON); without it the standard `json` module is used.
 
-Try it without hardware: choose **Simulation** in the dropdown and press **Connect**.
-
-Tests (use the simulator, no hardware needed):
+Tests (they use the simulator, no hardware needed):
 
 ```powershell
 cd imu_teng_monitor
 ..\.venv\Scripts\python -m pytest tests -q
 ```
 
-## Connect the ESP32-C3
+## Connect the ESP32
 
-1. Open `firmware/stride_assist_gui/stride_assist_gui.ino`, set `WIFI_SSID` / `WIFI_PASS` (and the hotspot password), and flash it with the Arduino IDE
-   (libraries: Adafruit BNO08x, WebSockets by Markus Sattler). The firmware changes have not been compiled or tested on hardware, so build and test them first.
-   The GUI also works with a stock firmware that sends the same JSON without `r[]` and `seq`.
-2. Read the IP from the Serial Monitor (`Open in browser: http://x.x.x.x`). If Wi-Fi fails the board starts its own hotspot at `192.168.4.1`.
-3. PC on the same network, enter the IP in the app, press **Connect**. Keep the TENG untouched for about 1 s while the baseline is measured.
+Enter the ESP32's IP in the header and press **Connect**. The GUI connects to `ws://<ip>:81/`. It sends nothing except the text
+`zero` when you press **Reset**, which asks the ESP32 to re-zero the TENG baselines.
 
-## Protocol
+**Firmware:** the GUI reads the "version 2" message format below. The firmware is not part of this repository, and a firmware
+that sends the older format (single `v` array, `ok`/`iok`/`cal`/`clip`, quaternion, gravity, ...) is **not** supported: those frames
+are logged as invalid packets.
 
-WebSocket `ws://<ip>:81/`, JSON text frames pushed by the ESP32 (every 10 ms with this firmware, 20 ms stock). Fields:
-`t` (ESP32 ms), `ok`/`iok` (ADS1115 / BNO08x present), `cal`, `clip`, `fs`, `sr` (TENG samples per second), `b` (baseline, mV),
-`q[4]`, `qa`, `rpy[3]` (deg), `a[3]` (m/s²), `g[3]` (rad/s), `lin[3]`, `grav[3]`, `mag[3]` (µT), `steps`, `stab`, and
-`v[]`, the calibrated TENG volts of every sample since the previous frame. Added by this repo's firmware: `seq` (frame counter) and
-`r[]` (raw ADC code per sample, same length as `v`, only used for the debug sheet). The GUI sends nothing.
+## Protocol (version 2)
 
-## TENG voltage: how it is calculated, and what is not verified
+First message after connecting (configuration, not a data frame): `{"info": {... "scales" ..., "range_V": ...}}`.
+`range_V` is used in the clip banner text; the rest is stored in the Excel summary.
 
-The TENG is read by an **ADS1115** (16-bit, ±2.048 V), not by the ESP32's internal ADC. The circuit is TENG → 1 MΩ → node (A3), node → 100 kΩ → bias
-(A0, 1.65 V), read differentially as A0 − A3. The firmware computes
+Then about 50 data frames per second, every value an integer:
 
 ```
-vdiff  = raw * 2.048 / 32768
-V_TENG = SIGN * (vdiff - baseline) / divRatio        divRatio = (R_SHUNT || R_ADC) / (R_SERIES + R_SHUNT || R_ADC) ≈ 0.0876
+{"t":ms, "s":status, "cp":us, "r":[roll,pitch,yaw], "a":[x,y,z], "g":[x,y,z], "f":[...], "m":[...], "b":[...]}
 ```
 
-The GUI shows these volts unchanged (no second scaling). **This is not oscilloscope-calibrated.** In one simultaneous capture against a
-scope the ESP32 trace had inverted sign (`SIGN` would need to be `-1`) and a much larger amplitude than the scope CSV; the cause (for example the
-scope probe setting) was not resolved, and large peaks saturate the ADS1115 input. Treat absolute volts as uncalibrated until you
-calibrate against your own instrument. The A0 reference is only validated (rest level within 50 mV), never subtracted again.
+| field | meaning |
+| --- | --- |
+| `t` | ESP32 `millis()` of the newest sample |
+| `cp` | sample period in microseconds |
+| `r` | Euler angles, value / 100 = degrees |
+| `a`, `g` | accelerometer value / 1000 = m/s², gyroscope value / 1000 = rad/s |
+| `f`, `m`, `b` | TENG Front (A0), Middle (A1), Back (A2), value / 1000 = volts; all three the same length n |
+| `s` | status bit mask: 1 ADS ok, 2 IMU ok, 4 calibrating, 8 / 16 / 32 front / middle / back clipped in this frame |
+
+**Time axis:** sample k of an n-sample frame happened at `t − (n−1−k)·cp/1000` ms on the ESP32 clock. That is used for plots, Vpp and
+exports; the frame arrival time is never used for sample times (it only labels the wall-clock start). A restart of the ESP32 clock
+is detected and the axis continues instead of jumping back.
+
+## Calibration: applied in one place
+
+The firmware sends calibrated volts, so **the firmware's calibration is the one that applies**. `imu_teng_monitor/config/channels.py`
+has a per-channel `scale` / `sign` block that is a pass-through and must stay at 1.0 / +1; it is applied in exactly one place
+(`sensors/pipeline.py`). If it is changed the app logs an "applied twice" warning on every connection. The Excel summary records that
+the volts are firmware-calibrated.
+
+## Saving
+
+**Excel:** `TENG Data` (Timestamp, Time (s), Channel, TENG Voltage (V), Measurement Validity, Display segment), `IMU Data`
+(roll, pitch, yaw, accelerometer, gyroscope, IMU OK) and `Session Summary` (per-channel min / max / average, connection info,
+the firmware info message). **CSV:** one row per TENG sample with the channel name, volts, validity and the latest IMU columns.
+Export runs in a background thread, in chunks, so the UI never waits. Everything stays in memory until saved
+(about 100 MB per hour); sheets continue on `... 2` past 1,000,000 rows.
+
+## How it stays fast
+
+- Receive, parse (orjson if installed, once per message), timestamps, calibration pass-through, ring buffers, the sliding Vpp window
+  and recording all run in the receive thread. The UI thread only reads small snapshots under a short lock and draws.
+- Preallocated numpy ring buffers per TENG channel and for the IMU. Vpp uses a monotonic deque: O(1) amortised per sample, using
+  each sample's own timestamp.
+- Charts redraw at about 25 fps and only when new data arrived (not while paused or minimised); numbers refresh at about 15 Hz.
+  The visible window is min/max-decimated to at most 2 points per pixel (peaks survive); Y axes rescale at most 5 times per second;
+  antialiasing is off; each Y axis uses a single tick level (pyqtgraph's default horizontal grid alone cost about 17 ms per repaint).
+- Measured with three simulated channels in a 2559×1400 window: process CPU about 42 % of one core (the previous version of this
+  app: 98.6 %), graph area draw about 13 ms per frame (previously 17.5 ms).
 
 ## Project layout
 
 ```
 imu_teng_monitor/
   main.py                 entry point
-  communication/          WebSocket client thread, JSON parser
-  sensors/                pipeline, TENG / IMU processors, scope measurements, timebase
-  storage/                in-memory session store, Excel exporter
-  gui/                    main window, panels, theme, custom widgets
-  simulation/             fake ESP32 for demos and tests
-  tests/                  pytest suite
-firmware/stride_assist_gui/   ESP32 sketch (optional changes over a stock sketch)
+  communication/          WebSocket client thread, version 2 parser
+  sensors/                pipeline, ring buffer, sliding min/max, time axis
+  storage/                in-memory session store, Excel / CSV export
+  gui/                    main window, cards, charts, theme
+  simulation/             fake ESP32 (version 2) for demos and tests
+  config/                 channel config block, settings
+  tests/                  pytest suite (parser, time axis, Vpp, pipeline, GUI against the simulator)
 ```
 
-Memory note: everything is kept in RAM until saved, roughly 150 MB per hour of TENG samples plus 90 MB per hour of IMU frames.
+## Known limits
+
+- Tested against the built-in simulator only; not validated on real hardware by this repository's tests.
+- The ESP32 reaction to the `zero` command and the keys of the `info` message other than `range_V` are not verified.
+- If the IMU is not detected (status bit 2 clear) the IMU values stay at zero and the GUI logs that once per connection.
+- No license has been chosen for this repository yet.
 
 ## Credits
 
 - UI direction follows the [unslop](https://github.com/heydamir/unslop) design guidance by Damir Sokolovsky (CC BY 4.0).
 - Fonts: [Geist and Geist Mono](https://github.com/vercel/geist-font) (SIL Open Font License, see `imu_teng_monitor/assets/fonts/OFL.txt`).
-- No license has been chosen for this repository yet.

@@ -1,15 +1,14 @@
-"""WebSocket client running in its own QThread.
+"""WebSocket client in its own QThread: receive -> parse once -> process, all off the UI thread.
 
-All output goes through one thread-safe deque (`events`) so ordering between
-state changes, log lines and data frames is preserved. The GUI thread drains it
-on a timer; nothing is ever discarded here (the deque is unbounded and drained
-every few milliseconds).
-
-Event tuples:
+The UI thread never touches frames. `on_packet(pkt)` (the pipeline) runs in this thread and returns a list of
+(level, text) errors; `on_info(info)` receives the {"info": ...} message that follows a connection. Only connection
+events and errors reach the UI, through a small thread-safe deque:
   ("state", "connecting" | "connected" | "disconnected", wall_time)
   ("log", level, message, wall_time)
-  ("packet", Packet)
-  ("bad", reason, snippet, wall_time)
+Nothing is logged per message; repeated invalid frames are summarised at most twice a second.
+
+Commands to the ESP32 (the text "zero" re-zeroes the TENG baselines) are queued with `send_text` and written by this
+thread between receives, so the socket is never read and written from two threads at once.
 """
 from __future__ import annotations
 
@@ -20,21 +19,30 @@ import websocket  # websocket-client
 from PySide6.QtCore import QThread
 
 from config import settings
-from communication.data_parser import PacketError, parse_packet
+from communication.data_parser import Info, PacketError, parse_packet
 
 
 class ESP32Client(QThread):
-    def __init__(self, host: str, port: int = settings.WS_PORT, parent=None):
+    def __init__(self, host: str, port: int, on_packet, on_connect=None, on_bad=None, on_info=None, parent=None):
         super().__init__(parent)
         self.host, self.port = host, port
         self.url = f"ws://{host}:{port}{settings.WS_PATH}"
+        self.on_packet, self.on_connect, self.on_bad, self.on_info = on_packet, on_connect, on_bad, on_info
         self.events: deque = deque()
+        self._outbox: deque = deque()
         self._stop_requested = False
-        self.frames_received = 0
+        self._last_err_log = {}
+        self.connected = False
 
-    # -- control ---------------------------------------------------------
     def stop(self):
         self._stop_requested = True
+
+    def send_text(self, text: str) -> bool:
+        """Queue a text command for the ESP32. Returns False if there is no connection to send it on."""
+        if not self.connected:
+            return False
+        self._outbox.append(text)
+        return True
 
     # -- helpers ---------------------------------------------------------
     def _log(self, level, msg):
@@ -47,6 +55,12 @@ class ESP32Client(QThread):
         end = time.monotonic() + seconds
         while not self._stop_requested and time.monotonic() < end:
             time.sleep(0.05)
+
+    def _rate_limited_error(self, key, text, every=0.5, level="ERROR"):
+        now = time.monotonic()
+        if now - self._last_err_log.get(key, 0.0) >= every:
+            self._last_err_log[key] = now
+            self._log(level, text)
 
     # -- thread body -----------------------------------------------------
     def run(self):
@@ -66,8 +80,13 @@ class ESP32Client(QThread):
                 continue
 
             attempt = 0
+            self._outbox.clear()
+            if self.on_connect:
+                self.on_connect()
+            self.connected = True
             self._state("connected")
             self._receive_loop(ws)
+            self.connected = False
             try:
                 ws.close()
             except Exception:  # noqa: BLE001
@@ -76,10 +95,15 @@ class ESP32Client(QThread):
             if not self._stop_requested:
                 self._sleep(settings.RECONNECT_DELAY_S[0])
 
+    def _flush_outbox(self, ws):
+        while self._outbox:
+            ws.send(self._outbox.popleft())
+
     def _receive_loop(self, ws):
         last_rx = time.monotonic()
         while not self._stop_requested:
             try:
+                self._flush_outbox(ws)
                 msg = ws.recv()
             except websocket.WebSocketTimeoutException:
                 if time.monotonic() - last_rx > settings.STALE_TIMEOUT_S:
@@ -99,12 +123,20 @@ class ESP32Client(QThread):
                     self._log("ERROR", "Connection closed by ESP32")
                 return
             last_rx = time.monotonic()
-            self.frames_received += 1
-            rx_wall, rx_perf = time.time(), time.perf_counter()
             try:
-                pkt = parse_packet(msg, rx_wall, rx_perf)
+                pkt = parse_packet(msg, time.time())                # parsed exactly once, here
             except PacketError as e:
-                snippet = msg[:80] if isinstance(msg, str) else repr(msg[:40])
-                self.events.append(("bad", str(e), snippet, rx_wall))
+                if self.on_bad:
+                    self.on_bad()
+                snippet = msg[:60] if isinstance(msg, str) else repr(msg[:30])
+                self._rate_limited_error("bad", f"Invalid packet: {e} | {snippet!r}")
                 continue
-            self.events.append(("packet", pkt))
+            try:
+                if isinstance(pkt, Info):                           # configuration, not a data frame
+                    if self.on_info:
+                        self.on_info(pkt)
+                    continue
+                for level, text in self.on_packet(pkt):
+                    self._rate_limited_error(text[:30], text, every=2.0, level=level)
+            except Exception as e:  # noqa: BLE001 - a bug must not kill the connection
+                self._rate_limited_error("proc", f"Processing error: {type(e).__name__}: {e}", every=2.0)

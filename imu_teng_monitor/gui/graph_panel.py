@@ -1,11 +1,19 @@
-"""Four scrolling plots: TENG, accelerometer, gyroscope, orientation (roll/pitch/yaw).
+"""Live charts: three TENG plots (Front, Middle, Back) stacked on a shared time axis, then Accelerometer,
+Gyroscope and Orientation (roll/pitch/yaw).
 
-The TENG plot is the main one and carries the scope furniture: Vmax/Vmin cursors with labels, a band
-marking the measured window and amber trigger-level markers at +/- the step-capture threshold.
-(Magnetometer is shown numerically and saved to Excel, but not plotted.)
+Speed (see README, measured):
+  * the UI thread only draws: samples are written into preallocated ring buffers by the receive thread and copied
+    here under a short lock;
+  * only the visible time window is drawn, min/max-decimated to at most 2 points per horizontal pixel (peaks survive);
+  * 1 px pens, no antialiasing, no fill, no legends on the TENG plots, no per-frame autorange: the Y axes are
+    rescaled at most 5 times per second;
+  * the TENG and IMU plots live on separate canvases, and nothing is redrawn when no new data arrived.
 """
 from __future__ import annotations
 
+import time
+
+import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
@@ -14,23 +22,92 @@ from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QVBoxLayou
 from config import settings
 from gui import theme
 from gui.widgets import set_visible_animated
-from sensors.imu_processor import ImuProcessor
-from sensors.scope_processor import ScopeProcessor
-from sensors.teng_processor import TengProcessor
 
 pg.setConfigOptions(antialias=False, background=theme.CARD, foreground=theme.MUTED)
-
 GRID_ALPHA = 0.10
+
+
+def minmax_decimate(t: np.ndarray, v: np.ndarray, max_points: int):
+    """Reduce (t, v) to at most `max_points` points keeping every bin's minimum and maximum, in time order."""
+    n = len(t)
+    if n <= max_points or max_points < 4:
+        return t, v
+    bins = max_points // 2
+    step = n // bins
+    m = step * bins
+    vv = v[n - m:].reshape(bins, step)              # newest m samples, so the right edge stays exact
+    tt = t[n - m:].reshape(bins, step)
+    i_min, i_max = vv.argmin(axis=1), vv.argmax(axis=1)
+    first, second = np.minimum(i_min, i_max), np.maximum(i_min, i_max)
+    rows = np.arange(bins)
+    out_t, out_v = np.empty(2 * bins), np.empty(2 * bins)
+    out_t[0::2], out_v[0::2] = tt[rows, first], vv[rows, first]
+    out_t[1::2], out_v[1::2] = tt[rows, second], vv[rows, second]
+    if out_t[-1] < t[-1]:                           # always end the trace on the newest sample
+        out_t, out_v = np.append(out_t, t[-1]), np.append(out_v, v[-1])
+    return out_t, out_v
+
+
+def nice_step(span: float, target: int = 4) -> float:
+    """A 1 / 2 / 5 x 10^k tick step giving about `target` ticks over `span`."""
+    raw = max(span, 1e-9) / target
+    mag = 10 ** np.floor(np.log10(raw))
+    for m in (1, 2, 5, 10):
+        if raw <= m * mag:
+            return float(m * mag)
+    return float(10 * mag)
+
+
+def _style_axes(p, bottom_values):
+    font = QFont(theme.MONO)
+    font.setPixelSize(11)
+    for name in ("left", "bottom"):
+        ax = p.getAxis(name)
+        ax.setTickFont(font)
+        ax.setPen(pg.mkPen(theme.BORDER_HEX))
+        ax.setTextPen(pg.mkPen(theme.MUTED))
+    p.getAxis("left").setWidth(56)
+    p.getAxis("left").enableAutoSIPrefix(False)
+    p.getAxis("bottom").setStyle(showValues=bottom_values)
+    if bottom_values:
+        p.setLabel("bottom", "Time (s)", color=theme.MUTED)
+
+
+def _plot(glw, row, title, unit, bottom_values, title_color=theme.TEXT2, col=0):
+    p = glw.addPlot(row=row, col=col)
+    p.setTitle(title, color=title_color, size="9pt")
+    p.setLabel("left", unit, color=theme.MUTED)
+    # pyqtgraph's default horizontal grid draws several tick levels and cost ~17 ms per repaint (measured). We keep
+    # the grid but give each Y axis ONE tick level with a 1/2/5 step chosen when the axis is rescaled (_yrange).
+    p.showGrid(x=True, y=True, alpha=GRID_ALPHA)
+    p.addItem(pg.InfiniteLine(0, angle=0, pen=pg.mkPen(theme.MUTED, width=1, style=Qt.DashLine)), ignoreBounds=True)
+    p.setMouseEnabled(x=False, y=False)
+    p.hideButtons()
+    p.setMenuEnabled(False)
+    p.enableAutoRange(False)                        # Y is rescaled by us, at most 5 times per second
+    _style_axes(p, bottom_values)
+    return p
+
+
+def _curve(plot, color, name=None):
+    c = plot.plot(pen=pg.mkPen(color, width=1), name=name, skipFiniteCheck=True)
+    c.setDownsampling(ds=1, auto=False)
+    c.setClipToView(False)
+    return c
 
 
 class GraphPanel(QWidget):
     def __init__(self):
         super().__init__()
         self.window_s = settings.DEFAULT_GRAPH_WINDOW_S
+        self._gen = -1
+        self._y_last = 0.0
+        self.p_teng: list = []
+        self.c_teng: list = []
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-
         bar = QHBoxLayout()
         bar.setContentsMargins(4, 0, 0, 0)
         self.paused_chip = QLabel("Paused, recording continues")
@@ -42,7 +119,7 @@ class GraphPanel(QWidget):
         for s in settings.GRAPH_WINDOWS_S:
             self.combo.addItem(f"{s} s", s)
         self.combo.setCurrentIndex(settings.GRAPH_WINDOWS_S.index(settings.DEFAULT_GRAPH_WINDOW_S))
-        self.combo.currentIndexChanged.connect(lambda: setattr(self, "window_s", self.combo.currentData()))
+        self.combo.currentIndexChanged.connect(self._window_changed)
         bar.addWidget(self.paused_chip)
         bar.addStretch(1)
         bar.addWidget(lbl)
@@ -53,127 +130,111 @@ class GraphPanel(QWidget):
         frame.setObjectName("card")
         fl = QVBoxLayout(frame)
         fl.setContentsMargins(8, 8, 8, 8)
-        self.glw = pg.GraphicsLayoutWidget()
-        self.glw.setBackground(theme.CARD)
-        self.glw.ci.layout.setSpacing(4)
-        fl.addWidget(self.glw)
+        fl.setSpacing(4)
+        self.glw_teng = pg.GraphicsLayoutWidget()
+        self.glw_imu = pg.GraphicsLayoutWidget()
+        for g in (self.glw_teng, self.glw_imu):
+            g.setBackground(theme.CARD)
+            g.ci.layout.setSpacing(4)
+        self.glw_teng.setMinimumHeight(330)             # three plots of >= 110 px
+        self.glw_imu.setMinimumHeight(190)
+        fl.addWidget(self.glw_teng, 5)
+        fl.addWidget(self.glw_imu, 3)
         lay.addWidget(frame, 1)
 
-        self.p_teng = self._plot(0, "TENG voltage", "V")
-        self.c_teng = self.p_teng.plot(pen=pg.mkPen(theme.TENG_COLOR, width=1.5), name="TENG (V)")
-        self.c_teng.setDownsampling(auto=True, method="peak")
-        self.c_teng.setFillLevel(0)
-        self.c_teng.setBrush(pg.mkBrush(230, 180, 80, 38))        # area above/below 0 V shows the sign
-        self.c_teng.setClipToView(True)
-        self.p_teng.addItem(pg.InfiniteLine(0, angle=0, pen=pg.mkPen(theme.MUTED, width=1, style=Qt.DashLine)))
+        self.p_acc, self.c_acc = self._xyz(0, "Accelerometer", "m/s²", ("X", "Y", "Z"))
+        self.p_gyr, self.c_gyr = self._xyz(1, "Gyroscope", "rad/s", ("X", "Y", "Z"))
+        self.p_rpy, self.c_rpy = self._xyz(2, "Orientation", "deg", ("Roll", "Pitch", "Yaw"))
+        self.imu_plots = [self.p_acc, self.p_gyr, self.p_rpy]
+        self.imu_curves = self.c_acc + self.c_gyr + self.c_rpy
 
-        mono = QFont(theme.MONO)
-        mono.setPixelSize(11)
+    def _window_changed(self):
+        self.window_s = self.combo.currentData()
+        self._gen = -1                                # redraw now
 
-        def cursor(text, color, pos):
-            return pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen(color, width=1, style=Qt.DashLine),
-                                   label=text, labelOpts={"position": pos, "color": color, "movable": False,
-                                                          "fill": (25, 25, 27, 230)})
-        # measurement cursors (neutral) and trigger markers (accent)
-        self.l_max = cursor("Vmax {value:0.2f} V", theme.TEXT2, 0.07)
-        self.l_min = cursor("Vmin {value:0.2f} V", theme.TEXT2, 0.07)
-        self.band = pg.LinearRegionItem(values=(0, 1), movable=False, brush=pg.mkBrush(237, 237, 237, 9),
-                                        pen=pg.mkPen(None))
-        self.band.setZValue(-10)
-        self.t_hi = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen(theme.ACCENT, width=1, style=Qt.DotLine),
-                                    label="Trigger ±{value:0.2f} V",
-                                    labelOpts={"position": 0.93, "color": theme.ACCENT, "movable": False,
-                                               "fill": (25, 25, 27, 230)},
-                                    markers=[("<|", 1.0, 8)])
-        self.t_lo = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen(theme.ACCENT, width=1, style=Qt.DotLine),
-                                    markers=[("<|", 1.0, 8)])
-        self._furniture = (self.l_max, self.l_min, self.band, self.t_hi, self.t_lo)
-        for it in self._furniture:
-            self.p_teng.addItem(it, ignoreBounds=True)
-            it.hide()
+    def _xyz(self, col, title, unit, names):
+        """IMU charts sit side by side (one column each) so every one gets a readable height."""
+        p = _plot(self.glw_imu, 0, title, unit, True, col=col)
+        p.addLegend(offset=(-6, 4), labelTextColor=theme.TEXT2, brush=pg.mkBrush(25, 25, 27, 200),
+                    pen=pg.mkPen(None), colCount=1)
+        return p, [_curve(p, color, n) for color, n in zip(theme.SERIES, names)]
 
-        self.p_acc, self.c_acc = self._xyz(1, "Accelerometer", "m/s²", ("X", "Y", "Z"))
-        self.p_gyr, self.c_gyr = self._xyz(2, "Gyroscope", "rad/s", ("X", "Y", "Z"))
-        self.p_rpy, self.c_rpy = self._xyz(3, "Orientation", "deg", ("Roll", "Pitch", "Yaw"))
-        self.plots = [self.p_teng, self.p_acc, self.p_gyr, self.p_rpy]
-        self.glw.ci.layout.setRowStretchFactor(0, 3)          # the TENG trace is the main chart
-        for p in self.plots[1:]:
-            p.setXLink(self.p_teng)
+    def set_channels(self, cfgs):
+        """(Re)build the stacked TENG plots: 3 for the foot, 1 for the stock firmware."""
+        self.glw_teng.clear()
+        self.p_teng, self.c_teng = [], []
+        n = len(cfgs)
+        for k, cfg in enumerate(cfgs):
+            p = _plot(self.glw_teng, k, cfg.label, "V", k == n - 1, title_color=cfg.color)
+            if self.p_teng:
+                p.setXLink(self.p_teng[0])          # shared time axis
+            self.p_teng.append(p)
+            self.c_teng.append(_curve(p, cfg.color))
+        self._gen = -1
 
-    def _plot(self, row, title, unit):
-        p = self.glw.addPlot(row=row, col=0)
-        p.setTitle(title, color=theme.TEXT2, size="10pt")
-        p.setLabel("left", unit, color=theme.MUTED)
-        p.showGrid(x=True, y=True, alpha=GRID_ALPHA)
-        p.addLegend(offset=(-8, 4), labelTextColor=theme.TEXT2, brush=pg.mkBrush(25, 25, 27, 200),
-                    pen=pg.mkPen(None), colCount=3 if row else 1)
-        p.setMouseEnabled(x=False, y=False)
-        p.hideButtons()
-        p.setMenuEnabled(False)
-        p.enableAutoRange(axis="y")
-        p.setAutoVisible(y=True)
-        font = QFont(theme.MONO)
-        font.setPixelSize(11)
-        for name in ("left", "bottom"):
-            ax = p.getAxis(name)
-            ax.setTickFont(font)
-            ax.setPen(pg.mkPen(theme.BORDER_HEX))
-            ax.setTextPen(pg.mkPen(theme.MUTED))
-        if row < 3:
-            p.getAxis("bottom").setStyle(showValues=False)
-        else:
-            p.setLabel("bottom", "Time (s)", color=theme.MUTED)
-        p.getAxis("left").setWidth(56)
-        p.getAxis("left").enableAutoSIPrefix(False)         # no "(x0.001)" axis scaling
-        return p
-
-    def _xyz(self, row, title, unit, names):
-        p = self._plot(row, title, unit)
-        curves = []
-        for color, n in zip(theme.SERIES, names):
-            c = p.plot(pen=pg.mkPen(color, width=1.5), name=f"{n}")
-            c.setClipToView(True)
-            curves.append(c)
-        return p, curves
-
-    # ------------------------------------------------------------------
     def set_paused(self, paused: bool):
         set_visible_animated(self.paused_chip, paused)
+        if not paused:
+            self._gen = -1
 
-    def refresh(self, teng: TengProcessor, imu: ImuProcessor, scope: ScopeProcessor):
-        tn = max(teng.buffer._buf[teng.buffer.n - 1, 0] if teng.buffer.n else -1e9,
-                 imu.buffer._buf[imu.buffer.n - 1, 0] if imu.buffer.n else -1e9)
-        if tn < -1e8:
+    # ------------------------------------------------------------------ live
+    def _max_points(self, plot) -> int:
+        w = plot.vb.width()
+        return int(max(200, (w if w > 50 else 800) * settings.MAX_POINTS_PER_PIXEL))
+
+    def refresh(self, pl):
+        """Draw if (and only if) new data arrived since the last draw. Called by the ~25 fps timer."""
+        gen = pl.gen
+        if gen == self._gen or not self.p_teng:
             return
-        t1 = max(tn, self.window_s)                 # sweep from the left until the window is full
+        self._gen = gen
+        chans = pl.channels
+        if not chans:
+            return
+        tn = max(c.t_last for c in chans)
+        t1 = max(tn, self.window_s)                  # sweep from the left until the window is full
         t0 = t1 - self.window_s
-        w = teng.buffer.window(t0)
-        if len(w):
-            self.c_teng.setData(w[:, 0], w[:, 1])
-        w = imu.buffer.window(t0)
-        if len(w):
-            x = w[:, 0]
-            for curves, base in ((self.c_acc, 1), (self.c_gyr, 4), (self.c_rpy, 7)):
-                for i, c in enumerate(curves):
-                    c.setData(x, w[:, base + i])
-        self.p_teng.setXRange(t0, t1, padding=0)
-        w = scope.latest
-        if w is None:
-            for it in self._furniture:
-                it.hide()
-        else:
-            for it in self._furniture:          # show first: line labels only re-format while visible
-                it.show()
-            self.l_max.setPos(w.vmax)
-            self.l_min.setPos(w.vmin)
-            self.band.setRegion((w.t_start, w.t_end))
-            self.t_hi.setPos(scope.threshold)
-            self.t_lo.setPos(-scope.threshold)
-            for ln in (self.l_max, self.l_min, self.t_hi):
-                ln.label.valueChanged()
+        now = time.perf_counter()
+        rescale = now - self._y_last >= 1.0 / settings.YSCALE_MAX_HZ
+        if rescale:
+            self._y_last = now
+
+        for k, (p, c) in enumerate(zip(self.p_teng, self.c_teng)):
+            arr, _ = pl.view_teng(k, t0)
+            if arr is None or not len(arr):
+                continue
+            x, y = minmax_decimate(arr[:, 0], arr[:, 1], self._max_points(p))
+            c.setData(x, y, skipFiniteCheck=True)
+            if rescale:
+                self._yrange(p, y.min(), y.max())
+        self.p_teng[0].setXRange(t0, t1, padding=0)
+
+        imu = pl.view_imu(t0)
+        if len(imu):
+            t = imu[:, 0]
+            mp = self._max_points(self.p_acc)
+            for i, c in enumerate(self.imu_curves):
+                x, y = minmax_decimate(t, imu[:, 1 + i], mp)
+                c.setData(x, y, skipFiniteCheck=True)
+            if rescale:
+                for j, p in enumerate(self.imu_plots):
+                    block = imu[:, 1 + 3 * j:4 + 3 * j]
+                    self._yrange(p, block.min(), block.max())
+        for p in self.imu_plots:
+            p.setXRange(t0, t1, padding=0)
+
+    @staticmethod
+    def _yrange(plot, lo, hi):
+        pad = max(0.1 * (hi - lo), 0.05)
+        plot.setYRange(lo - pad, hi + pad, padding=0)
+        height = max(plot.vb.height(), 40.0)
+        span = hi - lo + 2 * pad
+        step = nice_step(span, target=int(max(3, min(6, height // 30))))   # 3 to 6 labels, never fewer than 3
+        while span / step < 2.5 and step > 1e-9:                          # always label both sides of zero
+            step /= 2
+        plot.getAxis("left").setTickSpacing(levels=[(step, 0)])
 
     def clear(self):
-        for c in [self.c_teng, *self.c_acc, *self.c_gyr, *self.c_rpy]:
+        for c in self.c_teng + self.imu_curves:
             c.setData([], [])
-        for it in self._furniture:
-            it.hide()
+        self._gen = -1

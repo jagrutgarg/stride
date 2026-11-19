@@ -1,64 +1,86 @@
-"""Parse the JSON frames produced by the ESP32 firmware (buildJson()).
+"""Parse ESP32 "version 2" messages, once, in the receive thread (orjson if installed, else json).
 
-Frame fields (firmware names):
-  t      millis() on the ESP32            ok     ADS1115 found     iok   BNO085 found
-  cal    TENG baseline calibrating        clip   input clipped     fs    readable range [V]
-  d      A0-A3 differential [mV]          b      baseline [mV]     sr    TENG samples/s
-  q      [w,x,y,z] quaternion             qa     quaternion accuracy [rad]
-  rpy    [roll,pitch,yaw] [deg]           a      accelerometer [m/s^2]
-  g      gyroscope [rad/s]                lin    linear accel [m/s^2]
-  grav   gravity [m/s^2]                  mag    magnetometer [uT]
-  steps  step counter                     stab   stability class (0..4)
-  v      list of calibrated TENG volts, one per ADS1115 sample since the last frame
-Optional (added by firmware/stride_assist_gui, absent on the stock firmware):
-  r      list of raw ADS1115 codes (int16), same length as v
-  seq    frame counter
-  a0, a0s  A0 reference voltage [V] measured by the firmware's start-up self-test and its verdict
-         (0 = not measured, 1 = within 1.45..1.85 V, 2 = outside)
+Info message (the first message after connecting; configuration, NOT a data frame):
+    {"info": {... scales ..., "range_V": ...}}
+
+Data frame (about 50 per second, every value an integer):
+    {"t":ms, "s":status, "cp":us, "r":[roll,pitch,yaw], "a":[x,y,z], "g":[x,y,z], "f":[...], "m":[...], "b":[...]}
+
+    t   ESP32 millis() when the frame was sent            cp  sample period in microseconds
+    r   Euler angles, value / 100  = degrees              a   accelerometer, value / 1000 = m/s^2
+    g   gyroscope, value / 1000    = rad/s
+    f / m / b   TENG Front (A0) / Middle (A1) / Back (A2), value / 1000 = volts, already calibrated by the firmware.
+                All three have the same length n. Sample k happened at  t - (n-1-k) * cp / 1000  ms.
+    s   status bit mask: 1 ADS ok, 2 IMU ok, 4 calibrating, 8 / 16 / 32 front / middle / back clipped in this frame
+
+No other field is read. Anything from the old format (v, pp, mx, mn, hpp, hmx, hmn, d, b as a number, sr, q, qa, rpy,
+lin, grav, mag, steps, stab, ok, iok, cal, clip, fs) is not used anywhere; such a frame is reported as invalid.
 """
 from __future__ import annotations
 
 import json
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
+
+import numpy as np
+
+try:                                    # much faster than json; falls back silently
+    import orjson
+    _loads = orjson.loads
+    JSON_LIB = "orjson"
+except ImportError:                     # pragma: no cover
+    _loads = json.loads
+    JSON_LIB = "json"
+
+# scale divisors of the version 2 format
+DEG_DIV, ACC_DIV, GYRO_DIV, VOLT_DIV = 100.0, 1000.0, 1000.0, 1000.0
+# status bits
+ST_ADS_OK, ST_IMU_OK, ST_CALIBRATING = 1, 2, 4
+ST_CLIP = (8, 16, 32)                   # front, middle, back
+CHANNEL_IDS = ("A0", "A1", "A2")        # f, m, b
 
 
 class PacketError(ValueError):
     """Raised for corrupted / incomplete / invalid frames."""
 
 
-@dataclass
+@dataclass(slots=True)
+class ChannelFrame:
+    id: str
+    clip: bool
+    v: np.ndarray                      # volts (float64), oldest to newest
+
+
+@dataclass(slots=True)
 class Packet:
-    rx_wall: float                 # time.time() at reception
-    rx_perf: float                 # time.perf_counter() at reception
+    rx_wall: float                     # time.time() at reception (only used to label wall-clock time)
     t_ms: float
-    ads_ok: bool
-    imu_ok: bool
-    calibrating: bool
-    clipped: bool
-    full_scale_v: float
-    diff_mv: float
-    baseline_mv: float
-    sr: float
-    quat: List[float]
-    quat_acc: float
-    rpy: List[float]
-    acc: List[float]
-    gyro: List[float]
-    lin: List[float]
-    grav: List[float]
-    mag: List[float]
-    steps: int
-    stab: int
-    v: List[float]
-    raw: Optional[List[int]] = None
-    seq: Optional[int] = None
-    a0_v: Optional[float] = None
-    a0_status: Optional[int] = None
+    status: int
+    cp_us: float
+    rpy: tuple                         # degrees
+    acc: tuple                         # m/s^2
+    gyro: tuple                        # rad/s
+    channels: List[ChannelFrame] = field(default_factory=list)
+
+    @property
+    def ads_ok(self) -> bool:
+        return bool(self.status & ST_ADS_OK)
+
+    @property
+    def imu_ok(self) -> bool:
+        return bool(self.status & ST_IMU_OK)
+
+    @property
+    def calibrating(self) -> bool:
+        return bool(self.status & ST_CALIBRATING)
 
 
-_VEC3 = ("rpy", "a", "g", "lin", "grav", "mag")
+@dataclass(slots=True)
+class Info:
+    """The {"info": {...}} message. `range_v` is the readable TENG range in volts if the firmware sent one."""
+    raw: dict
+    range_v: float | None
 
 
 def _num(x, name):
@@ -69,64 +91,63 @@ def _num(x, name):
     return float(x)
 
 
-def _vec(d, key, n):
-    if key not in d:
-        raise PacketError(f"missing field '{key}'")
-    arr = d[key]
-    if not isinstance(arr, list) or len(arr) != n:
-        raise PacketError(f"field '{key}' must be a list of {n} numbers")
-    return [_num(x, key) for x in arr]
+def _vec3(d, key, div):
+    a = d.get(key)
+    if not isinstance(a, list) or len(a) != 3:
+        raise PacketError(f"field '{key}' must be a list of 3 integers")
+    return (_num(a[0], key) / div, _num(a[1], key) / div, _num(a[2], key) / div)
 
 
-def parse_packet(text: str, rx_wall: float, rx_perf: float) -> Packet:
-    if not isinstance(text, str):
-        raise PacketError("binary frame received (expected JSON text)")
+def _volts(x, name):
+    if not isinstance(x, list):
+        raise PacketError(f"field '{name}' must be a list")
     try:
-        d = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise PacketError(f"JSON decode error: {e.msg} (pos {e.pos})") from None
+        v = np.asarray(x, dtype=np.float64)
+    except (TypeError, ValueError):
+        raise PacketError(f"field '{name}' has a non-numeric entry") from None
+    if v.ndim != 1 or not np.isfinite(v).all():
+        raise PacketError(f"field '{name}' is not a flat list of finite numbers")
+    return v / VOLT_DIV
+
+
+def _range_v(info: dict):
+    r = info.get("range_V")
+    if isinstance(r, (int, float)) and not isinstance(r, bool) and math.isfinite(r):
+        return float(r)
+    if isinstance(r, list) and r and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in r):
+        return float(max(abs(x) for x in r))
+    return None
+
+
+def parse_packet(text, rx_wall: float):
+    """Return a Packet (data frame) or an Info (configuration message). Raises PacketError for anything else."""
+    if not isinstance(text, (str, bytes)):
+        raise PacketError("unexpected frame type")
+    try:
+        d = _loads(text)
+    except Exception as e:  # json.JSONDecodeError / orjson.JSONDecodeError
+        raise PacketError(f"JSON decode error: {str(e)[:60]}") from None
     if not isinstance(d, dict):
         raise PacketError("frame is not a JSON object")
-    for k in ("t", "ok", "iok", "cal", "clip", "d", "b", "sr", "qa", "steps", "stab", "q", "v") + _VEC3:
+    if "info" in d:
+        info = d["info"]
+        if not isinstance(info, dict):
+            raise PacketError("'info' is not an object")
+        return Info(raw=info, range_v=_range_v(info))
+    for k in ("t", "s", "cp", "r", "a", "g", "f", "m", "b"):
         if k not in d:
-            raise PacketError(f"missing field '{k}'")
-
-    v = d["v"]
-    if not isinstance(v, list):
-        raise PacketError("field 'v' must be a list")
-    v = [_num(x, "v") for x in v]
-
-    raw = None
-    if "r" in d:
-        r = d["r"]
-        if not isinstance(r, list) or len(r) != len(v):
-            raise PacketError("field 'r' length does not match 'v'")
-        raw = []
-        for x in r:
-            x = _num(x, "r")
-            if x != int(x) or not -32768 <= x <= 32767:
-                raise PacketError("raw ADC value out of int16 range")
-            raw.append(int(x))
-
-    seq = None
-    if "seq" in d:
-        seq = int(_num(d["seq"], "seq"))
-
-    a0_v = a0_status = None
-    if "a0" in d and "a0s" in d:
-        a0_v, a0_status = _num(d["a0"], "a0"), int(_num(d["a0s"], "a0s"))
-
+            raise PacketError(f"not a version 2 frame: missing field '{k}'")
+    status = _num(d["s"], "s")
+    cp = _num(d["cp"], "cp")
+    if status != int(status) or status < 0:
+        raise PacketError("field 's' must be a non-negative integer")
+    if cp <= 0:
+        raise PacketError("field 'cp' must be positive")
+    f, m, b = _volts(d["f"], "f"), _volts(d["m"], "m"), _volts(d["b"], "b")
+    if not (len(f) == len(m) == len(b)):
+        raise PacketError(f"f, m and b must have the same length (got {len(f)}, {len(m)}, {len(b)})")
+    status = int(status)
     return Packet(
-        rx_wall=rx_wall, rx_perf=rx_perf,
-        t_ms=_num(d["t"], "t"),
-        ads_ok=bool(d["ok"]), imu_ok=bool(d["iok"]),
-        calibrating=bool(d["cal"]), clipped=bool(d["clip"]),
-        full_scale_v=_num(d.get("fs", 0.0), "fs"),
-        diff_mv=_num(d["d"], "d"), baseline_mv=_num(d["b"], "b"),
-        sr=_num(d["sr"], "sr"),
-        quat=_vec(d, "q", 4), quat_acc=_num(d["qa"], "qa"),
-        rpy=_vec(d, "rpy", 3), acc=_vec(d, "a", 3), gyro=_vec(d, "g", 3),
-        lin=_vec(d, "lin", 3), grav=_vec(d, "grav", 3), mag=_vec(d, "mag", 3),
-        steps=int(_num(d["steps"], "steps")), stab=int(_num(d["stab"], "stab")),
-        v=v, raw=raw, seq=seq, a0_v=a0_v, a0_status=a0_status,
-    )
+        rx_wall=rx_wall, t_ms=_num(d["t"], "t"), status=status, cp_us=cp,
+        rpy=_vec3(d, "r", DEG_DIV), acc=_vec3(d, "a", ACC_DIV), gyro=_vec3(d, "g", GYRO_DIV),
+        channels=[ChannelFrame(CHANNEL_IDS[i], bool(status & ST_CLIP[i]), v) for i, v in enumerate((f, m, b))])

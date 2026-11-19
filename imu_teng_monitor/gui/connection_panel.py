@@ -74,8 +74,7 @@ class ConnectionPanel(QFrame):
         lay.addStretch(1)
 
         self._vals = {}
-        for key, title in (("ip", "ESP32 address"), ("dur", "Connected for"),
-                           ("last", "Last data"), ("hz", "Frame rate")):
+        for key, title in (("last", "Last data"), ("hz", "Frame rate")):
             box, v = _info(title)
             self._vals[key] = v
             w = QWidget()
@@ -113,19 +112,12 @@ class ConnectionPanel(QFrame):
         self.btn_disconnect.setEnabled(busy)
         self.mode.setEnabled(not busy)
         self.ip.setEnabled(not busy and not self.simulation)
-        if target:
-            self._vals["ip"].setText(target)
 
-    def update_info(self, connected_since, last_rx_wall, rate_hz):
+    def update_info(self, last_rx_wall, rate_hz):
         v = self._vals
         # the dot's ring pulses only while frames are really arriving
         if self._state == "connected":
             self.dot.set_state(theme.GREEN, active=rate_hz > 0)
-        if connected_since is None:
-            v["dur"].setText("--")
-        else:
-            s = int(time.monotonic() - connected_since)
-            v["dur"].setText(f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}")
         if last_rx_wall is None:
             v["last"].setText("--")
         else:

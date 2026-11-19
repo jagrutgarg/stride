@@ -80,6 +80,12 @@ QTextEdit, QPlainTextEdit {{
     background: {BG}; border: 1px solid {BORDER}; border-radius: 8px; padding: 4px 8px;
     font-family: '{MONO}', Consolas; font-size: 12px;
 }}
+QTabWidget::pane {{ border: none; }}
+QTabBar {{ background: transparent; }}
+QTabBar::tab {{ background: transparent; color: {MUTED}; padding: 8px 12px; border: none;
+    border-bottom: 2px solid transparent; margin-right: 4px; }}
+QTabBar::tab:selected {{ color: {TEXT}; border-bottom: 2px solid {ACCENT}; }}
+QTabBar::tab:hover:!selected {{ color: {TEXT2}; }}
 QToolTip {{ background: {RAISED}; color: {TEXT}; border: 1px solid {BORDER}; padding: 4px 8px; }}
 QSplitter::handle {{ background: {BG}; }}
 QScrollArea {{ background: transparent; border: none; }}

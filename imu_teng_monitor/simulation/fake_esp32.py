@@ -1,12 +1,15 @@
-"""Simulated ESP32 (SIMULATION ONLY - not hardware).
+"""Simulated ESP32, "version 2" message format (SIMULATION ONLY - not hardware).
 
-Serves the same WebSocket JSON frames as the real firmware so the whole GUI
-pipeline can be exercised without hardware. Run standalone:
-    python -m simulation.fake_esp32 [--port 8765] [--bad 0.0]
+Run standalone:   python -m simulation.fake_esp32 [--port 8765] [--bad 0.0] [--seconds 30]
 or let the GUI start it in "Simulation" mode.
 
-Constants below mirror the firmware (divider ratio 0.0876, ADS LSB, 1.2 ms TENG
-period) only so that simulated raw codes and volts are self-consistent.
+Sends what the version 2 firmware sends: first {"info": {...}}, then about 100 frames per second
+    {"t":ms,"s":status,"cp":us,"r":[...],"a":[...],"g":[...],"f":[...],"m":[...],"b":[...]}
+with integer values (r in 1/100 deg, a and g in 1/1000, f/m/b in millivolts). The three TENG trains are about
++/-5 V bipolar pulse pairs with noise, once per 1.1 s: Back fires first, Middle 40 ms later, Front 80 ms after Back.
+The sample period `cp` is 3700 us (about 270 samples/s), and sample k of an n-sample frame is at t - (n-1-k)*cp.
+The text command "zero" starts a 0.6 s baseline recalibration (status bit 4), like the real firmware.
+`amp` (volts) and `range_v` can be changed at run time; a pulse beyond range_v is clamped and sets the clip bit.
 """
 from __future__ import annotations
 
@@ -20,19 +23,28 @@ import time
 
 from websockets.asyncio.server import serve
 
-ADS_LSB_V = 2.048 / 32768.0
-DIV_RATIO = 0.0876
-PERIOD_S = 1.2e-3
+CP_US = 3700
 SEND_S = 0.010
+CH_DELAY_S = (0.080, 0.040, 0.0)        # Front, Middle, Back: Back fires first
+CH_GAIN = (1.0, 0.8, 1.0)
+ZERO_CAL_S = 0.6
+FIRST_CAL_S = 1.0
+
+
+def _pulse(ph, amp):
+    return amp * math.exp(-((ph - 0.20) / 0.020) ** 2) - amp * math.exp(-((ph - 0.26) / 0.030) ** 2)
 
 
 class FakeESP32Server:
-    def __init__(self, host="127.0.0.1", port=8765, bad_rate=0.0, with_raw=True):
-        self.host, self.port, self.bad_rate, self.with_raw = host, port, bad_rate, with_raw
+    def __init__(self, host="127.0.0.1", port=8765, bad_rate=0.0):
+        self.host, self.port, self.bad_rate = host, port, bad_rate
         self.drop_clients_flag = False
-        self.amp = 20.0               # pulse amplitude [V] (demo: about +/-20 V)
-        self.fs = 25.0                # simulated readable range [V]; |v| beyond it is clamped and clip=1
+        self.amp = 5.0                # pulse amplitude [V]
+        self.range_v = 18.3           # readable range [V]; beyond it a value is clamped and the clip bit is set
+        self.noise = 0.05
         self.stall = False            # True: keep connection open but send nothing
+        self.zero_count = 0           # "zero" commands received
+        self.send_info = True
         self._loop = None
         self._thread = None
         self._stop = None
@@ -66,16 +78,31 @@ class FakeESP32Server:
             self._ready.set()
             await self._stop.wait()
 
-    # -- frame generation ------------------------------------------------
+    # -- frames ------------------------------------------------------------
+    def _info(self):
+        return {"info": {"fw": "simulator v2", "scales": {"r": 100, "a": 1000, "g": 1000, "f": 1000, "m": 1000,
+                                                          "b": 1000}, "cp_us": CP_US, "range_V": self.range_v}}
+
+    async def _reader(self, ws, state):
+        """Commands from the GUI."""
+        try:
+            async for msg in ws:
+                if msg == "zero":
+                    self.zero_count += 1
+                    state["cal_until"] = time.perf_counter() - state["t0"] + ZERO_CAL_S
+        except Exception:  # noqa: BLE001 - client went away
+            pass
+
     async def _handler(self, ws):
         self.clients += 1
         rnd = random.Random(1)
         t0 = time.perf_counter()
-        seq = steps = 0
-        sample_t = 0.0
-        cal_until = 1.0                      # first second: baseline calibration
-        last_send = t0
+        state = {"t0": t0, "cal_until": FIRST_CAL_S}
+        reader = asyncio.create_task(self._reader(ws, state))
+        k_next = 0                                  # index of the next sample on the cp grid
         try:
+            if self.send_info:
+                await ws.send(json.dumps(self._info(), separators=(",", ":")))
             while not self._stop.is_set():
                 await asyncio.sleep(SEND_S)
                 if self.drop_clients_flag:
@@ -84,62 +111,47 @@ class FakeESP32Server:
                     return
                 if self.stall:
                     continue
-                now = time.perf_counter()
-                el = now - t0
-                vs, raws, clip = [], [], 0
-                while sample_t + PERIOD_S <= el:
-                    sample_t += PERIOD_S
-                    cal = sample_t < cal_until
-                    # periodic "footstep" pulse pair + noise
-                    ph = (sample_t % 1.1)
-                    v = 0.0 if cal else (
-                        self.amp * math.exp(-((ph - 0.20) / 0.020) ** 2)
-                        - self.amp * math.exp(-((ph - 0.26) / 0.030) ** 2)
-                        + rnd.gauss(0, 0.05))
-                    if abs(v) > self.fs:
-                        v, clip = math.copysign(self.fs, v), 1
-                    v = round(v, 3)
-                    raw = max(-32768, min(32767, int(round((v * DIV_RATIO) / ADS_LSB_V))))   # baseline = 0
-                    vs.append(v)
-                    raws.append(raw)
-                if int(el * 1.1) > steps:
-                    steps = int(el * 1.1)
+                el = time.perf_counter() - t0
+                t_ms = int(el * 1000)
+                # samples whose time (k * cp) is <= the frame time; the newest one is at t_frame
+                k_last = int(el / (CP_US / 1e6))
+                n = max(0, k_last - k_next + 1)
+                ks = range(k_next, k_next + n)
+                k_next += n
+                cal = el < state["cal_until"]
+                trains, clip = [[], [], []], 0
+                for k in ks:
+                    ts = k * CP_US / 1e6
+                    for c in range(3):
+                        v = 0.0 if cal else _pulse((ts - CH_DELAY_S[c]) % 1.1, self.amp * CH_GAIN[c]) + \
+                            rnd.gauss(0, self.noise)
+                        if abs(v) > self.range_v:
+                            v, clip = math.copysign(self.range_v, v), clip | (8 << c)
+                        trains[c].append(round(v * 1000))
                 w = 2 * math.pi * 0.5
                 roll = 20 * math.sin(w * el)
                 pitch = 10 * math.sin(w * el * 0.7 + 1)
                 yaw = (30 * el) % 360 - 180
-                ca, sa = math.cos(math.radians(roll) / 2), math.sin(math.radians(roll) / 2)
                 frame = {
-                    "t": int(el * 1000) + 5000, "ok": 1, "iok": 1,
-                    "cal": 1 if el < cal_until else 0, "clip": clip, "fs": self.fs,
-                    "d": round((raws[-1] if raws else 0) * ADS_LSB_V * 1000, 2), "b": 0.31,
-                    "pk": 0, "mx": 0, "mn": 0, "pp": 0, "hmx": 0, "hmn": 0, "hpp": 0, "sr": 833,
-                    "q": [round(ca, 4), round(sa, 4), 0.0, 0.0], "qa": 0.021,
-                    "rpy": [round(roll, 2), round(pitch, 2), round(yaw, 2)],
-                    "a": [round(2 * math.sin(w * el), 3), round(1.5 * math.cos(w * el), 3),
-                          round(9.81 + 3 * math.sin(2 * w * el), 3)],
-                    "g": [round(0.8 * math.cos(w * el), 4), round(0.5 * math.sin(w * el), 4), 0.01],
-                    "lin": [round(2 * math.sin(w * el), 3), round(1.5 * math.cos(w * el), 3), 0.1],
-                    "grav": [0.0, 0.0, 9.81],
-                    "mag": [round(20 + 5 * math.sin(el), 2), round(-8 + 3 * math.cos(el), 2), 40.0],
-                    "steps": steps, "stab": 4, "v": vs,
+                    "t": t_ms + 5000, "s": 1 | 2 | (4 if cal else 0) | clip, "cp": CP_US,
+                    "r": [round(roll * 100), round(pitch * 100), round(yaw * 100)],
+                    "a": [round(2000 * math.sin(w * el)), round(1500 * math.cos(w * el)),
+                          round(9810 + 3000 * math.sin(2 * w * el))],
+                    "g": [round(800 * math.cos(w * el)), round(500 * math.sin(w * el)), 10],
+                    "f": trains[0], "m": trains[1], "b": trains[2],
                 }
-                if self.with_raw:
-                    frame["r"] = raws
-                    frame["seq"] = seq
-                seq += 1
                 text = json.dumps(frame, separators=(",", ":"))
                 if self.inject_bad:
                     await ws.send(self.inject_bad.pop(0))
                 if self.bad_rate and rnd.random() < self.bad_rate:
                     text = rnd.choice([text[: len(text) // 2], "garbage{{", '{"t":1}',
-                                       text.replace('"mag":[', '"mag":["x",')])
+                                       text.replace('"a":[', '"a":["x",')])
                 await ws.send(text)
                 self.frames_sent += 1
-                last_send = now
         except Exception:  # client went away
             pass
         finally:
+            reader.cancel()
             self.clients -= 1
 
 
@@ -148,13 +160,15 @@ if __name__ == "__main__":
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--bad", type=float, default=0.0, help="fraction of corrupted frames")
-    ap.add_argument("--stock", action="store_true", help="omit r[] and seq like the stock firmware")
+    ap.add_argument("--seconds", type=float, default=0, help="exit by itself after this many seconds (0 = run until Ctrl+C)")
     a = ap.parse_args()
-    s = FakeESP32Server(a.host, a.port, a.bad, with_raw=not a.stock)
+    s = FakeESP32Server(a.host, a.port, a.bad)
     s.start()
-    print(f"Fake ESP32 on ws://{a.host}:{a.port}/  (Ctrl+C to stop)")
+    print(f"Fake ESP32 (version 2 format) on ws://{a.host}:{a.port}/  (Ctrl+C to stop)")
     try:
-        while True:
-            time.sleep(1)
+        end = time.time() + a.seconds if a.seconds else None
+        while end is None or time.time() < end:
+            time.sleep(0.5)
     except KeyboardInterrupt:
-        s.stop()
+        pass
+    s.stop()

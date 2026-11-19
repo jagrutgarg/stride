@@ -5,6 +5,7 @@ import time
 
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QTextEdit, QVBoxLayout
 
+from config import settings
 from gui import theme
 from gui.widgets import AnimatedButton
 
@@ -30,7 +31,7 @@ class LogPanel(QFrame):
         lay.addLayout(head)
         self.view = QTextEdit()
         self.view.setReadOnly(True)
-        self.view.document().setMaximumBlockCount(2000)   # visible log only; data is never trimmed
+        self.view.document().setMaximumBlockCount(settings.LOG_MAX_LINES)   # visible log only; data is never trimmed
         lay.addWidget(self.view)
         self.btn_clear.clicked.connect(self.clear)
 
